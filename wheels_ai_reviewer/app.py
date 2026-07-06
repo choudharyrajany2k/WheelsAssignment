@@ -19,6 +19,7 @@ from msa_reviewer_agent import (
     CHECKLIST,
 )
 from report_utils import build_docx_report, build_pdf_report
+import config
 
 # ------------------------------------------
 # Configuration
@@ -29,6 +30,10 @@ st.set_page_config(
     page_icon="🚗",
     layout="wide"
 )
+
+USERNAME = config.USERNAME
+PASSWORD = config.PASSWORD
+print("here is the username and password:", USERNAME, "   ",PASSWORD)
 
 # ------------------------------------------
 # Session State
