@@ -176,15 +176,15 @@ def login_page():
 
                     st.error("Invalid username or password")
 
-            st.divider()
+#             st.divider()
 
-            st.caption("Demo Credentials")
+#             st.caption("Demo Credentials")
 
-            st.code(
-"""Username : admin
+#             st.code(
+# """Username : admin
 
-Password : admin"""
-            )
+# Password : admin"""
+#             )
 
     # Decorative graphic anchored at the bottom of the login page
     try:
@@ -199,6 +199,18 @@ Password : admin"""
 # ------------------------------------------
 
 
+# Maps each wizard step number to the page that renders it — used by the
+# back button in wizard() to know which page to return to.
+STEP_PAGES = {
+    1: "upload",
+    2: "extraction",
+    3: "ai_review",
+    4: "review",
+    5: "roi",
+    6: "report",
+}
+
+
 def wizard():
 
     steps = [
@@ -207,7 +219,9 @@ def wizard():
 
         "Extraction",
 
-        "Review",
+        "AI Review",
+
+        "Manual Review",
 
         "ROI",
 
@@ -215,19 +229,35 @@ def wizard():
 
     ]
 
-    cols = st.columns(len(steps))
+    nav_col, steps_col = st.columns([0.6, 11.4])
 
-    for i, col in enumerate(cols):
+    with nav_col:
 
-        with col:
+        if st.session_state.wizard_step > 1:
 
-            if i + 1 == st.session_state.wizard_step:
+            if st.button("⬅", key="wizard_back", help="Back to previous step"):
 
-                st.success(f"{i+1}. {steps[i]}")
+                st.session_state.wizard_step -= 1
 
-            else:
+                st.session_state.page = STEP_PAGES[st.session_state.wizard_step]
 
-                st.info(f"{i+1}. {steps[i]}")
+                st.rerun()
+
+    with steps_col:
+
+        cols = st.columns(len(steps))
+
+        for i, col in enumerate(cols):
+
+            with col:
+
+                if i + 1 == st.session_state.wizard_step:
+
+                    st.success(f"{i+1}. {steps[i]}")
+
+                else:
+
+                    st.info(f"{i+1}. {steps[i]}")
 
 def sidebar():
 
@@ -257,34 +287,6 @@ def sidebar():
             st.session_state.wizard_step = 1
 
             st.rerun()
-
-        st.divider()
-
-        st.markdown("### Wizard")
-
-        pages = [
-
-            "Upload",
-
-            "Extraction",
-
-            "Review",
-
-            "Business Value",
-
-            "Report"
-
-        ]
-
-        for i, p in enumerate(pages):
-
-            if i + 1 == st.session_state.wizard_step:
-
-                st.success(p)
-
-            else:
-
-                st.info(p)
 
         st.divider()
 
@@ -871,6 +873,31 @@ def extraction_page():
 
     st.divider()
 
+    if st.button("Continue to AI Review ➜", type="primary", use_container_width=True):
+
+        st.session_state.page = "ai_review"
+
+        st.session_state.wizard_step = 3
+
+        st.rerun()
+
+# ------------------------------------------
+# AI Review
+# ------------------------------------------
+#
+# Runs the automated checklist review against the extracted document text.
+# Kept as its own wizard step (separate from Extraction and from the
+# reviewer's manual Accept/Reject pass on the following step).
+
+
+def ai_review_page():
+
+    wizard()
+
+    st.title("Step 3")
+
+    doc_text = st.session_state.doc_text
+
     # ------------------------------------------------------------
     # Phase 2 — AI Contract Review
     # Only runs once the user explicitly clicks "Start Review".
@@ -1029,7 +1056,7 @@ def extraction_page():
 
         st.session_state.page = "review"
 
-        st.session_state.wizard_step = 3
+        st.session_state.wizard_step = 4
 
         st.rerun()
 
@@ -1037,9 +1064,9 @@ def review_page():
 
     wizard()
 
-    st.title("Step 3")
+    st.title("Step 4")
 
-    st.subheader("AI Review")
+    st.subheader("Manual Review")
 
     findings = st.session_state.review_findings
 
@@ -1331,7 +1358,7 @@ def review_page():
 
         st.session_state.page="roi"
 
-        st.session_state.wizard_step=4
+        st.session_state.wizard_step=5
 
         st.rerun()
 
@@ -1350,7 +1377,7 @@ def roi_page():
 
     wizard()
 
-    st.title("Step 4")
+    st.title("Step 5")
 
     st.subheader("Business Impact")
 
@@ -1495,7 +1522,7 @@ def roi_page():
 
             st.session_state.page = "review"
 
-            st.session_state.wizard_step = 3
+            st.session_state.wizard_step = 4
 
             st.rerun()
 
@@ -1505,7 +1532,7 @@ def roi_page():
 
             st.session_state.page = "report"
 
-            st.session_state.wizard_step = 5
+            st.session_state.wizard_step = 6
 
             st.rerun()
 
@@ -1518,7 +1545,7 @@ def report_page():
 
     wizard()
 
-    st.title("Step 5")
+    st.title("Step 6")
 
     st.subheader("Final Report")
 
@@ -1669,7 +1696,7 @@ def report_page():
 
         st.session_state.page = "roi"
 
-        st.session_state.wizard_step = 4
+        st.session_state.wizard_step = 5
 
         st.rerun()
 
@@ -1695,6 +1722,8 @@ else:
 
     elif st.session_state.page == "extraction":
         extraction_page()
+    elif st.session_state.page == "ai_review":
+        ai_review_page()
     elif st.session_state.page == "review":
         review_page()
     elif st.session_state.page == "roi":
