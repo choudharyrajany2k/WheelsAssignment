@@ -3,6 +3,7 @@ import streamlit as st
 from pathlib import Path
 import time  # used for elapsed-time display during parallel DI extraction
 import tempfile
+import hashlib
 from datetime import datetime
 from itertools import cycle
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,7 +20,8 @@ from msa_reviewer_agent import (
     CHECKLIST,
 )
 from report_utils import build_docx_report, build_pdf_report
-import config
+import db as reviewdb
+import plotly.express as px
 
 # ------------------------------------------
 # Configuration
@@ -31,9 +33,8 @@ st.set_page_config(
     layout="wide"
 )
 
-USERNAME = config.USERNAME
-PASSWORD = config.PASSWORD
-print("here is the username and password:", USERNAME, "   ",PASSWORD)
+USERNAME = "admin"
+PASSWORD = "admin"
 
 # ------------------------------------------
 # Session State
@@ -54,6 +55,11 @@ if "decisions" not in st.session_state:
 
 if "business_impact" not in st.session_state:
     st.session_state.business_impact = {}
+
+if "saved_review_id" not in st.session_state:
+    st.session_state.saved_review_id = None  # set once this review is persisted to review_history.db
+
+reviewdb.init_db()  # idempotent — creates review_history.db on first run only
 
 # ------------------------------------------
 # Navigation
@@ -169,6 +175,25 @@ def login_page():
                 else:
 
                     st.error("Invalid username or password")
+
+            st.divider()
+
+            st.caption("Demo Credentials")
+
+            st.code(
+"""Username : admin
+
+Password : admin"""
+            )
+
+    # Decorative graphic anchored at the bottom of the login page
+    try:
+        with open("assets/login_wave.svg", "r") as f:
+            login_wave_svg = f.read()
+        st.markdown(login_wave_svg, unsafe_allow_html=True)
+    except FileNotFoundError:
+        pass  # decorative only — don't break the login page if the asset is missing
+
 # ------------------------------------------
 # Wizard
 # ------------------------------------------
@@ -286,57 +311,124 @@ def dashboard():
 
     st.write("")
 
+    total_reviews = reviewdb.get_review_count()
+
+    if total_reviews == 0:
+
+        st.info("No reviews yet — upload a contract to get started.")
+
+        return
+
+    avg_score = reviewdb.get_average_score()
+
+    tier_counts = reviewdb.get_risk_tier_distribution()
+
+    most_common_tier = max(tier_counts, key=tier_counts.get) if tier_counts else "—"
+
     c1, c2, c3 = st.columns(3)
 
     c1.metric(
         "Contracts Reviewed",
-        128
+        total_reviews
     )
 
     c2.metric(
-        "Pending Reviews",
-        6
+        "Average Risk Score",
+        avg_score
     )
 
     c3.metric(
-        "Average Risk",
-        "Medium"
+        "Most Common Risk Tier",
+        most_common_tier
     )
 
     st.divider()
 
-    st.subheader("Recent Reviews")
+    col_chart, col_table = st.columns([1, 1.4])
 
-    st.dataframe(
-        [
-            {
-                "Customer":"ABC Logistics",
-                "Risk":"High"
-            },
-            {
-                "Customer":"Amazon Fleet",
-                "Risk":"Low"
-            },
-            {
-                "Customer":"FedEx",
-                "Risk":"Medium"
-            }
-        ],
-        use_container_width=True
-    )
+    with col_chart:
 
-    st.write("")
+        st.subheader("Risk Distribution")
 
-    # if st.button(
-    #     "Start New Review",
-    #     type="primary",
-    #     use_container_width=True
-    # ):
+        tier_order = ["Low Risk", "Moderate Risk", "High Risk", "Critical Risk"]
+        tier_colors = {
+            "Low Risk": "#1E7A5F",
+            "Moderate Risk": "#C9A227",
+            "High Risk": "#D97B29",
+            "Critical Risk": "#A3312A",
+        }
+        labels = [t for t in tier_order if tier_counts.get(t)]
+        values = [tier_counts[t] for t in labels]
 
-    #     st.session_state.page = "upload"
-    #     st.session_state.wizard_step = 1
+        fig = px.pie(
+            names=labels,
+            values=values,
+            color=labels,
+            color_discrete_map=tier_colors,
+            hole=0.45,
+        )
+        fig.update_traces(textinfo="label+value")
+        fig.update_layout(showlegend=False, margin=dict(l=10, r=10, t=10, b=10), height=320)
 
-    #     st.success("Upload page coming in Part 2 🚀")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_table:
+
+        st.subheader("Recent Reviews")
+
+        recent = reviewdb.get_recent_reviews(limit=10)
+
+        st.dataframe(
+            [
+                {
+                    "File Name": r["contract_name"],
+                    "Score": r["risk_score"],
+                    "Risk Tier": r["risk_tier"],
+                    "Reviewed": r["reviewed_at"][:16].replace("T", " "),
+                }
+                for r in recent
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.divider()
+
+    st.subheader("Download Past Reports")
+
+    st.caption("Re-download a previously generated report without re-running the review.")
+
+    recent = reviewdb.get_recent_reviews(limit=10)
+
+    for r in recent:
+
+        rcol1, rcol2, rcol3, rcol4 = st.columns([3, 1.2, 1, 1])
+
+        rcol1.write(r["contract_name"])
+
+        rcol2.write(r["risk_tier"])
+
+        reports = reviewdb.get_review_reports(r["id"])
+
+        file_stub = Path(r["contract_name"]).stem or "MSA_Review"
+
+        rcol3.download_button(
+            "DOCX",
+            data=reports["docx_report"],
+            file_name=f"{file_stub}_Review_Report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            key=f"dash_docx_{r['id']}",
+            use_container_width=True,
+        )
+
+        rcol4.download_button(
+            "PDF",
+            data=reports["pdf_report"],
+            file_name=f"{file_stub}_Review_Report.pdf",
+            mime="application/pdf",
+            key=f"dash_pdf_{r['id']}",
+            use_container_width=True,
+        )
 
 def upload_page():
 
@@ -382,6 +474,32 @@ def upload_page():
                     text = raw_bytes.decode("utf-8", errors="replace")
 
             raw_bytes = text.encode("utf-8")
+
+        contract_hash = hashlib.md5(raw_bytes).hexdigest()
+
+        if st.session_state.get("contract_hash") != contract_hash:
+
+            # BUG this fixes: page_markdowns/doc_text/review_findings/
+            # review_complete/decisions/business_impact were only ever set
+            # ONCE and never cleared on a new upload. So uploading contract B
+            # after finishing contract A's review skipped extraction and the
+            # AI review entirely, silently reusing contract A's cached
+            # results — "the older one shows". Clearing them here, only when
+            # the uploaded file's content actually changed (not on every
+            # incidental rerun of this page), makes each new document a
+            # clean run without also wiping in-progress state if the user
+            # just navigates back to Step 1 with the same file still selected.
+            for key in (
+                "page_markdowns", "doc_text",
+                "review_started", "review_complete", "review_findings",
+            ):
+                st.session_state.pop(key, None)
+
+            st.session_state.decisions = {}
+            st.session_state.business_impact = {}
+            st.session_state.saved_review_id = None
+
+        st.session_state.contract_hash = contract_hash
 
         with tempfile.NamedTemporaryFile(
             suffix=suffix,
@@ -1530,6 +1648,21 @@ def report_page():
             use_container_width=True,
         )
 
+    # Persist this review to history — guarded so a Streamlit rerun (e.g.
+    # clicking a download button) doesn't insert a duplicate row. Resets to
+    # None only when a new contract is uploaded (see upload_page()).
+    if st.session_state.saved_review_id is None:
+
+        st.session_state.saved_review_id = reviewdb.save_review(
+            contract_name=contract_name,
+            score=score,
+            fail_n=fail_n,
+            flag_n=flag_n,
+            pass_n=pass_n,
+            docx_bytes=docx_bytes,
+            pdf_bytes=pdf_bytes,
+        )
+
     st.divider()
 
     if st.button("⬅ Back to Business Impact"):
@@ -1552,19 +1685,19 @@ else:
 
     sidebar()
 
-if st.session_state.page == "dashboard":
+    if st.session_state.page == "dashboard":
 
-    dashboard()
+        dashboard()
 
-elif st.session_state.page == "upload":
+    elif st.session_state.page == "upload":
 
-    upload_page()
+        upload_page()
 
-elif st.session_state.page == "extraction":
-    extraction_page()
-elif st.session_state.page == "review":
-    review_page()
-elif st.session_state.page == "roi":
-    roi_page()
-elif st.session_state.page == "report":
-    report_page()
+    elif st.session_state.page == "extraction":
+        extraction_page()
+    elif st.session_state.page == "review":
+        review_page()
+    elif st.session_state.page == "roi":
+        roi_page()
+    elif st.session_state.page == "report":
+        report_page()

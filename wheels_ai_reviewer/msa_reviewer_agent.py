@@ -24,7 +24,6 @@ Extend later:
     - persist findings to a DB / render to docx via the docx skill
 """
 
-import json
 import math
 import os
 import re
@@ -37,7 +36,7 @@ from typing import Annotated, TypedDict
 from langchain_anthropic import ChatAnthropic
 from langgraph.graph import StateGraph, START, END
 from langgraph.constants import Send
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 import operator
 import config
 
@@ -85,6 +84,14 @@ def get_llm(model: str = DEFAULT_MODEL) -> ChatAnthropic:
             base_url=FOUNDRY_BASE_URL,
             anthropic_api_key=api_key,
             default_headers={"anthropic-version": "2023-06-01"},
+            temperature=0,   # BUG FIX: this branch is the one actually used when
+                             # Foundry is configured, and it was missing temperature=0
+                             # entirely — every call was sampling at Anthropic's
+                             # default temperature=1, which is the main reason
+                             # findings/scores drifted between runs on an identical
+                             # document. temperature=0 doesn't guarantee byte-identical
+                             # output (there's still minor floating-point nondeterminism
+                             # server-side), but it removes the large swings.
         )
         # --- Option B: Entra ID instead of a static key ---
         # from azure.identity import DefaultAzureCredential, get_bearer_token_provider
@@ -187,14 +194,44 @@ CHECKLIST: dict[str, dict] = {
 # 2. Structured output schema — forces the model to return checkable findings
 # ---------------------------------------------------------------------------
 
+import json
+from typing import Literal
+from pydantic import field_validator
+
+# Common synonyms/casing the model might drift into across runs. Anything not
+# in here that still isn't an exact match raises a validation error — loud
+# and retryable, instead of silently scoring as 0 (see BUG note below).
+_STATUS_ALIASES = {"passed": "pass", "ok": "pass", "flagged": "flag",
+                    "warning": "flag", "failed": "fail", "failure": "fail"}
+_SEVERITY_ALIASES = {"moderate": "medium", "med": "medium",
+                      "critical": "high", "severe": "high", "minor": "low"}
+
+
 class Finding(BaseModel):
     category: str
     checklist_item: str
-    status: str = Field(description="pass | flag | fail")
-    severity: str = Field(description="low | medium | high")
+    status: Literal["pass", "flag", "fail"] = Field(description="pass | flag | fail")
+    severity: Literal["low", "medium", "high"] = Field(description="low | medium | high")
     clause_reference: str = Field(description="Article/Schedule number or 'not found'")
     issue: str = Field(description="What's wrong, or why it passes")
     recommendation: str = Field(description="Concrete fix, or 'none' if passing")
+
+    @field_validator("status", "severity", mode="before")
+    @classmethod
+    def _normalize_vocab(cls, v, info):
+        # BUG this fixes: status/severity used to be a free `str`, so the
+        # model returning "Medium", "MEDIUM", " medium", "Moderate", etc.
+        # instead of exactly "medium" would silently fall through
+        # aggregate_node's `risk_weight.get(f.severity, 0)` as 0 — zeroing
+        # that finding's contribution to the score with no error raised.
+        # That alone can shift the total score between two runs that agreed
+        # on every actual judgment. Normalizing here makes casing/wording
+        # drift a non-issue instead of a silent scoring bug.
+        if isinstance(v, str):
+            cleaned = v.strip().lower()
+            aliases = _STATUS_ALIASES if info.field_name == "status" else _SEVERITY_ALIASES
+            return aliases.get(cleaned, cleaned)
+        return v
 
 
 class CategoryReview(BaseModel):
@@ -202,22 +239,18 @@ class CategoryReview(BaseModel):
 
     @field_validator("findings", mode="before")
     @classmethod
-    def _coerce_stringified_findings(cls, v):
-        """Some gateways (observed via the Azure AI Foundry Anthropic
-        passthrough) double-encode structured-output tool arguments, so
-        'findings' comes back as a JSON string like '[{"category": ...}]'
-        instead of an already-parsed list. Pydantic's list_type validation
-        rejects that outright (the 'Input should be a valid list
-        [type=list_type]' error). If we got a string, parse it as JSON before
-        validation proceeds; if that fails, raise a clearer error.
-        """
+    def _coerce_json_string(cls, v):
+        # BUG this fixes: "Input should be a valid list [type=list_type,
+        # input_value='[\n {\n "category": ...']" — some structured-output
+        # paths (seen through Azure AI Foundry's Anthropic-compatible tool
+        # calling) occasionally return `findings` as a JSON-encoded STRING
+        # inside the tool-call arguments instead of a native array. Parse it
+        # transparently instead of letting pydantic reject it outright.
         if isinstance(v, str):
             try:
                 v = json.loads(v)
             except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"'findings' was returned as a string and isn't valid JSON: {e}"
-                ) from e
+                raise ValueError(f"findings was a string that isn't valid JSON: {e}") from e
         return v
 
 
@@ -227,7 +260,7 @@ class CategoryReview(BaseModel):
 
 class ReviewState(TypedDict):
     doc_text: str
-    sections: dict          # {"ARTICLE 5": "...", "SCHEDULE A": "..."}
+    sections: dict          # {"1. Definitions": "...", "Schedule A": "...", ...} — keys are whatever headings the document uses, in document order
     findings: Annotated[list[Finding], operator.add]   # reducer merges parallel branches
     report_markdown: str
 
@@ -475,26 +508,34 @@ def split_markdown_by_page(markdown: str) -> list[str]:
     return chunks or [markdown.strip()]
 
 
-def split_into_sections(text: str) -> dict:
-    """Split on ARTICLE N / SCHEDULE X headings so each reviewer gets grounded context.
+SECTION_HEADING_RE = re.compile(r"^#{1,6}\s+(.*)$", re.MULTILINE)
 
-    Document Intelligence usually renders contract headings as markdown
-    headings (e.g. '## ARTICLE 5 — SERVICES...'), but styling can vary by
-    source formatting, so the pattern tolerates an optional leading run of '#'.
+
+def split_into_sections(text: str) -> dict:
+    """Split on markdown headings so each reviewer gets grounded context.
+
+    Generic across any agreement type: it relies on DI's heading structure
+    (any '#'-prefixed line), not contract-specific vocabulary like
+    'ARTICLE'/'SCHEDULE' — so it works the same for an MSA, NDA, lease, SOW,
+    employment agreement, etc.
     """
-    pattern = re.compile(
-        r"(^#{0,6}\s*ARTICLE \d+.*$|^#{0,6}\s*SCHEDULE [A-Z].*$)",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    parts = pattern.split(text)
+    matches = list(SECTION_HEADING_RE.finditer(text))
+    if not matches:
+        return {"FULL_DOCUMENT": text.strip()}
+
     sections = {}
-    current = "PREAMBLE"
-    for chunk in parts:
-        if pattern.match(chunk or ""):
-            current = chunk.strip().lstrip("#").strip()
-            sections[current] = ""
-        else:
-            sections[current] = sections.get(current, "") + chunk
+
+    preamble = text[:matches[0].start()].strip()
+    if preamble:
+        sections["PREAMBLE"] = preamble
+
+    for i, m in enumerate(matches):
+        title = m.group(1).strip()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        sections[title] = f"{sections[title]}\n\n{body}".strip() if title in sections else body
+
     return sections
 
 
@@ -540,6 +581,10 @@ find the relevant clause(s) in the contract text, decide pass/flag/fail, and giv
 concrete recommendation grounded in fleet-management industry norms (not generic legal
 boilerplate advice).
 
+For every finding, use EXACTLY one of these values (lowercase, no synonyms):
+  status:   pass | flag | fail
+  severity: low | medium | high
+
 Checklist items:
 {chr(10).join(f"- {i}" for i in spec['items'])}
 
@@ -549,7 +594,31 @@ Contract text (grouped by Article/Schedule):
     result: CategoryReview = get_structured_llm(category).invoke(prompt)
     for f in result.findings:
         f.category = category
-    return {"findings": result.findings}
+    return {"findings": _dedupe_findings(result.findings)}
+
+
+STATUS_SEVERITY_RANK = {"pass": 0, "flag": 1, "fail": 2}
+
+
+def _dedupe_findings(findings: list[Finding]) -> list[Finding]:
+    """BUG this fixes: streamlit.errors.StreamlitDuplicateElementKey on
+    'decision_{category}__{checklist_item}' in review_page(). Root cause
+    wasn't a graph/dispatch bug — dispatch() fans out exactly one Send per
+    category, so each category only ever runs once. The model itself
+    occasionally restates the same checklist_item as two separate Finding
+    entries within a single CategoryReview response (e.g. slightly
+    different wording of the same issue). Collapse those to one per
+    checklist_item here, at the source, before anything downstream (the
+    Streamlit UI, the aggregate report, decision keys) ever sees them —
+    keeping the more severe status if the two disagree, since surfacing the
+    riskier read is the safer default for a compliance review tool.
+    """
+    best: dict[str, Finding] = {}
+    for f in findings:
+        existing = best.get(f.checklist_item)
+        if existing is None or STATUS_SEVERITY_RANK.get(f.status, 0) > STATUS_SEVERITY_RANK.get(existing.status, 0):
+            best[f.checklist_item] = f
+    return list(best.values())
 
 
 def aggregate_node(state: ReviewState) -> dict:
